@@ -3,9 +3,9 @@
 工作流程：加载模板 → 清空原有内容 → 遍历 JSON blocks → 按 type/level 动态排版。
 
 排版规则（对齐示例文档，由 HierarchyProfile 驱动）：
-  - title / heading: 使用模板 Heading {level} 样式，不覆盖 run 级属性（依赖样式定义）
-  - annotation cn_subtitle: 使用 Heading {level} 样式，不覆盖 run 级属性（样式已定义宋体/bold）
-  - annotation en_text: Normal 样式, 按 profile.en_text_style 设置字体
+  - title / heading: Heading {level} 样式 + profile.style_map[level] run 级字体覆写
+  - annotation cn_subtitle: Heading {level} 样式 + profile.style_map[level] run 级字体覆写
+  - annotation en_text: Normal 样式 + profile.en_text_style run 级字体覆写
 """
 
 from __future__ import annotations
@@ -77,6 +77,35 @@ def _set_run_fonts(
         rFonts.set(qn("w:eastAsia"), east_asia_font)
 
 
+def _set_paragraph_spacing(paragraph, line_spacing: float | None):
+    """设置段落行距（仅当 line_spacing 非 None 时覆写）。"""
+    if line_spacing is not None:
+        paragraph.paragraph_format.line_spacing = line_spacing
+
+
+def _apply_profile_fonts(
+    run, paragraph, level: int,
+    profile: HierarchyProfile | None,
+):
+    """根据 profile.style_map[level] 设置 run 级字体和段落行距。
+
+    当 profile 不存在或该 level 无样式数据时不做任何覆写，
+    依赖模板 Heading 样式定义的继承。
+    """
+    if not profile or level not in profile.style_map:
+        return
+    si = profile.style_map[level]
+    if si.font_name or si.font_size_pt or si.east_asia_font:
+        _set_run_fonts(
+            run,
+            latin_font=si.font_name or "Times New Roman",
+            east_asia_font=si.east_asia_font,
+            size_pt=si.font_size_pt or 12,
+            bold=si.bold,
+        )
+    _set_paragraph_spacing(paragraph, si.line_spacing)
+
+
 # ── 模板加载与清空 ───────────────────────────────────────
 
 def _enforce_style_outline_levels(doc: Document):
@@ -135,22 +164,24 @@ def _add_heading_paragraph(
     doc: Document, text: str, level: int,
     profile: HierarchyProfile | None = None,
 ):
-    """添加 title / heading 段落，依赖模板 Heading 样式定义。"""
+    """添加 title / heading 段落，应用 profile 中学习到的 run 级字体属性。"""
     style_name = _get_heading_style_name(level, profile)
     para = doc.add_paragraph(style=style_name)
-    para.add_run(_sanitize(text))
+    run = para.add_run(_sanitize(text))
     _set_outline_level(para, level)
+    _apply_profile_fonts(run, para, level, profile)
 
 
 def _add_cn_subtitle_paragraph(
     doc: Document, cn_subtitle: str, level: int,
     profile: HierarchyProfile | None = None,
 ):
-    """添加中文小标题段落。"""
+    """添加中文小标题段落，应用 profile 中学习到的 run 级字体属性。"""
     style_name = _get_heading_style_name(level, profile)
     para = doc.add_paragraph(style=style_name)
-    para.add_run(_sanitize(cn_subtitle))
+    run = para.add_run(_sanitize(cn_subtitle))
     _set_outline_level(para, level)
+    _apply_profile_fonts(run, para, level, profile)
 
 
 def _add_en_text_paragraph(

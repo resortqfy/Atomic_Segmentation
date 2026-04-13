@@ -431,6 +431,85 @@ def test_outline_levels(profile):
     return True
 
 
+# ── Test 9: heading/cn_subtitle run 级字体验证 ────────────
+
+def test_run_level_fonts(profile):
+    logger.info("=" * 60)
+    logger.info("Test 9: heading/cn_subtitle run 级字体验证")
+    logger.info("=" * 60)
+
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx_generator import load_template, render_blocks_to_docx
+    from hierarchy_analyzer import _extract_heading_level
+
+    test_blocks = [
+        {"type": "heading", "level": 1, "text": "RunFont Test Title"},
+        {"type": "heading", "level": 2, "text": "Abstract"},
+        {"type": "annotation", "level": 3,
+         "cn_subtitle": "【研究背景】", "en_text": "Background text."},
+        {"type": "annotation", "level": 4,
+         "cn_subtitle": "【步骤一】", "en_text": "Step one."},
+        {"type": "annotation", "level": 5,
+         "cn_subtitle": "【深层标注】", "en_text": "Deeper annotation."},
+    ]
+
+    font_test_path = "test_runfont_output.docx"
+    doc = load_template(TEMPLATE_PATH)
+    render_blocks_to_docx(doc, test_blocks, font_test_path, profile)
+
+    doc_out = Document(font_test_path)
+
+    for p in doc_out.paragraphs:
+        if not p.text.strip() or not p.runs:
+            continue
+        style_name = p.style.name if p.style else "Normal"
+        hlevel = _extract_heading_level(style_name)
+        if hlevel is None:
+            continue
+
+        si = profile.style_map.get(hlevel)
+        if si is None:
+            continue
+
+        run = p.runs[0]
+        rPr = run._element.find(qn("w:rPr"))
+        ea_actual = None
+        ascii_actual = None
+        if rPr is not None:
+            rFonts = rPr.find(qn("w:rFonts"))
+            if rFonts is not None:
+                ea_actual = rFonts.get(qn("w:eastAsia"))
+                ascii_actual = rFonts.get(qn("w:ascii"))
+
+        tag = f"Level {hlevel}"
+
+        if si.font_name:
+            check(f"{tag} ascii font",
+                  ascii_actual == si.font_name,
+                  f"expected={si.font_name}, got={ascii_actual}")
+
+        if si.east_asia_font:
+            check(f"{tag} eastAsia font",
+                  ea_actual == si.east_asia_font,
+                  f"expected={si.east_asia_font}, got={ea_actual}")
+
+        if si.font_size_pt:
+            actual_size = run.font.size.pt if run.font.size else None
+            check(f"{tag} font size",
+                  actual_size == si.font_size_pt,
+                  f"expected={si.font_size_pt}, got={actual_size}")
+
+        check(f"{tag} bold",
+              run.bold == si.bold,
+              f"expected={si.bold}, got={run.bold}")
+
+    if os.path.isfile(font_test_path):
+        os.remove(font_test_path)
+
+    return True
+
+
 # ── 主入口 ───────────────────────────────────────────────
 
 def main():
@@ -450,6 +529,7 @@ def main():
     test_markdown_splitting()
     test_output_hierarchy_matches_template(profile)
     test_outline_levels(profile)
+    test_run_level_fonts(profile)
 
     logger.info("\n" + "=" * 70)
     logger.info("  测试结果: %d PASS, %d FAIL", PASS, FAIL)

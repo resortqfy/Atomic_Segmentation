@@ -33,6 +33,8 @@ class StyleInfo:
     bold: bool = False
     east_asia_font: str | None = None
     alignment: str | None = None
+    line_spacing: float | None = None
+    line_spacing_rule: str | None = None
 
 
 @dataclass
@@ -122,6 +124,12 @@ def _get_run_font_info(paragraph) -> StyleInfo:
     if alignment is not None:
         info.alignment = str(alignment)
 
+    pf = paragraph.paragraph_format
+    if pf.line_spacing is not None:
+        info.line_spacing = float(pf.line_spacing)
+    if pf.line_spacing_rule is not None:
+        info.line_spacing_rule = str(pf.line_spacing_rule)
+
     return info
 
 
@@ -155,6 +163,39 @@ def _get_style_font_info(style, base: StyleInfo) -> StyleInfo:
         base = _get_style_font_info(style.base_style, base)
 
     return base
+
+
+def _compute_majority_style(style_list: list[StyleInfo]) -> StyleInfo:
+    """从多个 StyleInfo 中按属性取众数，合成一个代表性 StyleInfo。"""
+    if not style_list:
+        return StyleInfo(style_name="Normal")
+    if len(style_list) == 1:
+        return style_list[0]
+
+    def _majority(values):
+        """取非 None 值的众数；全部为 None 时返回 None。"""
+        filtered = [v for v in values if v is not None]
+        if not filtered:
+            return None
+        return Counter(filtered).most_common(1)[0][0]
+
+    def _majority_nullable(values):
+        """取包含 None 在内的众数（用于 line_spacing 等可选覆写属性）。"""
+        return Counter(values).most_common(1)[0][0]
+
+    def _majority_bool(values):
+        return Counter(values).most_common(1)[0][0]
+
+    return StyleInfo(
+        style_name=_majority([s.style_name for s in style_list]) or "Normal",
+        font_name=_majority([s.font_name for s in style_list]),
+        font_size_pt=_majority([s.font_size_pt for s in style_list]),
+        bold=_majority_bool([s.bold for s in style_list]),
+        east_asia_font=_majority_nullable([s.east_asia_font for s in style_list]),
+        alignment=_majority([s.alignment for s in style_list]),
+        line_spacing=_majority_nullable([s.line_spacing for s in style_list]),
+        line_spacing_rule=_majority_nullable([s.line_spacing_rule for s in style_list]),
+    )
 
 
 # ── 核心分析 ──────────────────────────────────────────────
@@ -210,7 +251,8 @@ def analyze_template_hierarchy(docx_path: str) -> HierarchyProfile:
                 transitions.append((prev_level, hlevel))
             prev_level = hlevel
         else:
-            normal_styles.append(font_info)
+            if style_name == "Normal":
+                normal_styles.append(font_info)
             prev_level = None
 
     profile.level_counts = dict(level_counts)
@@ -248,10 +290,10 @@ def analyze_template_hierarchy(docx_path: str) -> HierarchyProfile:
 
     for lvl, style_list in level_styles.items():
         if style_list:
-            profile.style_map[lvl] = style_list[0]
+            profile.style_map[lvl] = _compute_majority_style(style_list)
 
     if normal_styles:
-        profile.en_text_style = normal_styles[0]
+        profile.en_text_style = _compute_majority_style(normal_styles)
 
     logger.info(
         "层级分析完成: max_level=%d, annotation_base=%d, cn_levels=%s",
