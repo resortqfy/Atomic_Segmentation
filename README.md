@@ -47,9 +47,7 @@ pip install -r requirements.txt
 DOC2X_API_KEY=your_doc2x_api_key
 DEEPSEEK_API_KEY=your_deepseek_api_key
 ```
-以下是为您补充了 API 获取简要说明的更新内容，您可以直接将这部分替换到您的 `README.md` 文件中：
 
-```markdown
 ### 2. 配置 API 密钥
 
 在项目根目录创建 `.env` 文件：
@@ -67,9 +65,7 @@ DEEPSEEK_API_KEY=your_deepseek_api_key
 *   **DeepSeek API**：
     *   官网地址：[DeepSeek 开放平台](https://platform.deepseek.com/)
     *   获取方法：注册并登录账号后，在左侧导航栏找到“API Keys”菜单，点击“创建 API Key”，生成后请妥善保存。
-```
 
-这样既补全了官网链接，又给出了清晰的获取路径，方便新用户快速上手。
 
 ### 3. 运行
 
