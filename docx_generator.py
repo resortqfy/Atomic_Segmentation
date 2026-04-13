@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from docx import Document
 from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 from docx.shared import Pt
 
 if TYPE_CHECKING:
@@ -108,29 +109,36 @@ def _apply_profile_fonts(
 
 # ── 模板加载与清空 ───────────────────────────────────────
 
-def _enforce_style_outline_levels(doc: Document):
-    """确保 Heading 1-6 样式定义中包含显式 w:outlineLvl（WPS 兼容）。"""
+def fix_and_enhance_heading_styles(doc: Document):
+    """修复并增强文档中的内置标题样式 (Heading 1 ~ Heading 9)。
+
+    将大纲级别 (w:outlineLvl) 直接注入到样式层面的 pPr 中，
+    采用"先移除旧标签再创建新标签"的方式避免残留冲突，
+    解决 WPS / Word 中段落属性被识别为"正文"的问题。
+    """
     enforced = 0
-    for level in range(1, 7):
+    for level in range(1, 10):
         style_name = f"Heading {level}"
-        try:
-            style = doc.styles[style_name]
-        except KeyError:
+        if style_name not in doc.styles:
             continue
-        pPr = style.element.find(qn("w:pPr"))
-        if pPr is None:
-            pPr = style.element.makeelement(qn("w:pPr"), {})
-            style.element.append(pPr)
-        outline = pPr.find(qn("w:outlineLvl"))
-        if outline is None:
-            outline = style.element.makeelement(qn("w:outlineLvl"), {})
-            pPr.append(outline)
-        expected_val = str(level - 1)
-        if outline.get(qn("w:val")) != expected_val:
-            outline.set(qn("w:val"), expected_val)
-            enforced += 1
+
+        style = doc.styles[style_name]
+        pPr = style._element.get_or_add_pPr()
+
+        existing = pPr.find(qn("w:outlineLvl"))
+        if existing is not None:
+            pPr.remove(existing)
+
+        outline_lvl = OxmlElement("w:outlineLvl")
+        outline_lvl.set(qn("w:val"), str(level - 1))
+        pPr.append(outline_lvl)
+        enforced += 1
+
     if enforced:
-        logger.info("已修正 %d 个 Heading 样式的 outlineLvl 定义", enforced)
+        logger.info(
+            "已向 %d 个 Heading 样式注入 outlineLvl 定义（WPS 大纲兼容）",
+            enforced,
+        )
 
 
 def load_template(template_path: str) -> Document:
@@ -143,7 +151,7 @@ def load_template(template_path: str) -> Document:
         if tag in ("p", "tbl"):
             body.remove(child)
 
-    _enforce_style_outline_levels(doc)
+    fix_and_enhance_heading_styles(doc)
     logger.info("模板加载完成，已清空内容，保留 %d 个样式", len(doc.styles))
     return doc
 
