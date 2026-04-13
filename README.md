@@ -48,6 +48,25 @@ DOC2X_API_KEY=your_doc2x_api_key
 DEEPSEEK_API_KEY=your_deepseek_api_key
 ```
 
+### 2. 配置 API 密钥
+
+在项目根目录创建 `.env` 文件：
+
+```env
+DOC2X_API_KEY=your_doc2x_api_key
+DEEPSEEK_API_KEY=your_deepseek_api_key
+```
+
+**API 平台官网及获取说明：**
+
+*   **Doc2X API**：
+    *   官网地址：[Doc2X 官方网站](https://doc2x.noedgeai.com/)
+    *   获取方法：注册并登录账号后，进入“开发者”或“API 管理”控制台，点击生成新的 API Token/Key 并复制。
+*   **DeepSeek API**：
+    *   官网地址：[DeepSeek 开放平台](https://platform.deepseek.com/)
+    *   获取方法：注册并登录账号后，在左侧导航栏找到“API Keys”菜单，点击“创建 API Key”，生成后请妥善保存。
+
+
 ### 3. 运行
 
 ```bash
