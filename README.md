@@ -43,15 +43,6 @@ pip install -r requirements.txt
 
 在项目根目录创建 `.env` 文件：
 
-```
-DOC2X_API_KEY=your_doc2x_api_key
-DEEPSEEK_API_KEY=your_deepseek_api_key
-```
-
-### 2. 配置 API 密钥
-
-在项目根目录创建 `.env` 文件：
-
 ```env
 DOC2X_API_KEY=your_doc2x_api_key
 DEEPSEEK_API_KEY=your_deepseek_api_key
