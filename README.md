@@ -39,6 +39,8 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+其中包含可选依赖 `json-repair`，用于在模型输出 JSON 轻微损坏时提高解析成功率。
+
 ### 2. 配置 API 密钥
 
 在项目根目录创建 `.env` 文件：
@@ -148,7 +150,11 @@ python hierarchy_analyzer.py 合并_正文标注_20251006_第3届.docx
 | `DEEPSEEK_MAX_WORKERS` | `16` | 最大并发数 |
 | `DEEPSEEK_KEEPALIVE_TIMEOUT` | `600` | 等待推理开始最大时长（秒） |
 | `DEEPSEEK_INFER_TIMEOUT` | `300` | 推理完成最大时长（秒） |
-| `CHUNK_MAX_CHARS` | `2000` | 文本分块最大字符数 |
+| `CHUNK_MAX_CHARS` | `2000` | 文本分块最大字符数（可用环境变量覆盖） |
+| `DEEPSEEK_MAX_TOKENS` | `8192` | 单次回复 `max_tokens`；设为 `0` 则不传参、用接口默认 |
+| `DEEPSEEK_JSON_REPAIR_ON_FAIL` | `1`（开启） | 本地解析失败时是否在末次尝试调用模型纠错；`0`/`false`/`no` 关闭 |
+| `ATOMIC_DEBUG_PARSE_LOG` | 关闭 | 设为 `1`/`true`/`yes` 时写入 NDJSON 与 `atomic-json-parse-failures.log`（已 `.gitignore`） |
+| `ATOMIC_DEBUG_SESSION_ID` | 空 | 可选；写入调试 NDJSON 的 `sessionId` 字段 |
 | `HIERARCHY_ANALYSIS_ENABLED` | `True` | 启用模板层级学习 |
 | `TEMPLATE_PATH` | `合并_正文标注_*.docx` | 默认模板路径 |
 

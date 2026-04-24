@@ -15,8 +15,13 @@ venv/
 # IDE
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
+
+# Local JSON parse debug artifacts (enable with ATOMIC_DEBUG_PARSE_LOG=1)
+debug-parse-*.ndjson
+atomic-json-parse-failures.log
 
 # OS
 .DS_Store
