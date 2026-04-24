@@ -3,3 +3,4 @@ openai
 python-docx
 python-dotenv
 httpx
+json-repair

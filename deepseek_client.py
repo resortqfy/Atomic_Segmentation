@@ -15,9 +15,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from openai import (
     AsyncOpenAI,
@@ -33,6 +35,64 @@ if TYPE_CHECKING:
     from hierarchy_analyzer import HierarchyProfile
 
 logger = logging.getLogger(__name__)
+
+_PKG_DIR = Path(__file__).resolve().parent
+_AGENT_DEBUG_LOG_PRIMARY = str(_PKG_DIR / ".cursor" / "parse-debug.ndjson")
+_AGENT_DEBUG_LOG_MIRROR = str(_PKG_DIR / "debug-parse-mirror.ndjson")
+_PARSE_FAILURE_APPEND_LOG = str(_PKG_DIR / "atomic-json-parse-failures.log")
+
+
+def _append_parse_failure_human(
+    section_heading: str,
+    raw: str,
+    balanced_count: int,
+    last_err: str | None,
+) -> None:
+    """排障时追加失败样本；需设置 ATOMIC_DEBUG_PARSE_LOG=1。"""
+    if not config.ATOMIC_DEBUG_PARSE_LOG:
+        return
+    try:
+        with open(_PARSE_FAILURE_APPEND_LOG, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n{'=' * 60}\n"
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {section_heading[:120]}\n"
+                f"len={len(raw)} balanced_spans={balanced_count} last_err={last_err!r}\n"
+                f"--- head (2000) ---\n{raw[:2000]}\n"
+            )
+    except OSError:
+        pass
+
+
+def _agent_debug_ndjson(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+    run_id: str = "parse-debug",
+) -> None:
+    if not config.ATOMIC_DEBUG_PARSE_LOG:
+        return
+    payload: dict[str, Any] = {
+        "timestamp": int(time.time() * 1000),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "runId": run_id,
+    }
+    if config.ATOMIC_DEBUG_SESSION_ID:
+        payload["sessionId"] = config.ATOMIC_DEBUG_SESSION_ID
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    for path in (_AGENT_DEBUG_LOG_PRIMARY, _AGENT_DEBUG_LOG_MIRROR):
+        try:
+            if path == _AGENT_DEBUG_LOG_PRIMARY:
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as _df:
+                _df.write(line)
+        except OSError:
+            pass
 
 # ── System Prompt 基础模板 ────────────────────────────────
 
@@ -66,8 +126,9 @@ _BASE_SYSTEM_PROMPT = """\
 严格要求：
 1. 将正文段落拆分为独立的原子句（通常按原句拆分）。
 2. 为每个原子句提炼一个高度概括其核心意思的中文小标题。
-3. 只输出 JSON 数组，不要输出任何解释性文字、markdown 标记或代码块包裹。
-4. 确保 JSON 格式合法，可被直接 json.loads() 解析。"""
+3. 只输出 JSON，不要输出任何解释性文字、markdown 标记、代码块包裹或推理过程标签（如 think 块）。
+4. 优先输出 JSON 数组；若使用 JSON 对象包裹数组，请使用键名 "blocks" 存放数组。
+5. 确保 JSON 格式合法，可被直接 json.loads() 解析。"""
 
 _DEFAULT_HIERARCHY_SECTION = """\
 层级使用规则：
@@ -89,6 +150,13 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
+def _max_tokens_kw() -> dict[str, int]:
+    n = getattr(config, "DEEPSEEK_MAX_TOKENS", 0)
+    if isinstance(n, int) and n > 0:
+        return {"max_tokens": n}
+    return {}
+
+
 def build_system_prompt(profile: HierarchyProfile | None = None) -> str:
     """根据 HierarchyProfile 动态构建 system prompt。"""
     if profile is not None:
@@ -100,31 +168,453 @@ def build_system_prompt(profile: HierarchyProfile | None = None) -> str:
 
 # ── JSON 提取与容错 ──────────────────────────────────────
 
-def _extract_json_array(text: str) -> list[dict] | None:
+# 标签名拆开拼接，避免部分环境对敏感标签名的误处理
+_think_tag = "think"
+_redacted_tag = "redacted_thinking"
+_LLM_NOISE_PATTERNS: tuple[str, ...] = (
+    rf"<{_think_tag}\b[^>]*>.*?</{_think_tag}>",
+    rf"<{_redacted_tag}\b[^>]*>.*?</{_redacted_tag}>",
+    r"<reasoning\b[^>]*>.*?</reasoning>",
+    r"<thought\b[^>]*>.*?</thought>",
+)
+
+
+def _strip_common_llm_wrappers(text: str) -> str:
+    """去掉模型偶发输出的推理标签、think 块等，避免前缀污染 JSON。"""
+    t = text.strip().lstrip("\ufeff")
+    for _ in range(8):
+        prev = t
+        for pat in _LLM_NOISE_PATTERNS:
+            t = re.sub(pat, "", t, flags=re.DOTALL | re.IGNORECASE)
+        t = t.strip()
+        if t == prev:
+            break
+    return t
+
+
+def _repair_json_array_text(s: str) -> str:
+    """轻量修复：多余尾逗号（在 ] 或 } 前）。不替换字符串值内的弯引号，以免破坏合法 JSON。"""
+    t = s.strip()
+    prev = None
+    while prev != t:
+        prev = t
+        t = re.sub(r",(\s*[\]}])", r"\1", t)
+    return t
+
+
+def _escape_raw_controls_in_json_strings(s: str) -> str:
+    """将 JSON 字符串值内的裸换行/回车/制表转为 \\n \\t，修复模型常犯的 Invalid control character。"""
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_string = False
+    escape = False
+    while i < n:
+        c = s[i]
+        if in_string:
+            if escape:
+                out.append(c)
+                escape = False
+            elif c == "\\":
+                out.append(c)
+                escape = True
+            elif c == '"':
+                out.append(c)
+                in_string = False
+            elif c == "\n":
+                out.append("\\n")
+            elif c == "\r":
+                if i + 1 < n and s[i + 1] == "\n":
+                    out.append("\\n")
+                    i += 1
+                else:
+                    out.append("\\n")
+            elif c == "\t":
+                out.append("\\t")
+            else:
+                out.append(c)
+        else:
+            out.append(c)
+            if c == '"':
+                in_string = True
+        i += 1
+    return "".join(out)
+
+
+def _escape_invalid_json_backslashes_in_strings(s: str) -> str:
+    """将 JSON 字符串值内非法 \\ 转义（如 LaTeX \\mu、\\mathbf）改为 \\\\，避免 Invalid \\escape。"""
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_string = False
+    while i < n:
+        c = s[i]
+        if not in_string:
+            out.append(c)
+            if c == '"':
+                in_string = True
+            i += 1
+            continue
+        if c == '"':
+            out.append(c)
+            in_string = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "u" and i + 5 < n and all(
+                ch in "0123456789abcdefABCDEF" for ch in s[i + 2 : i + 6]
+            ):
+                out.append(s[i : i + 6])
+                i += 6
+                continue
+            if nxt in '"\\/bfnrt':
+                out.append(c)
+                out.append(nxt)
+                i += 2
+                continue
+            out.append("\\\\")
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _json_loads_variants(s: str) -> tuple[Any, str | None]:
+    """依次尝试多种修复后的 json.loads；返回 (data, None) 或 (None, 最后一条错误信息)。"""
+    variants: list[str] = []
+    seen: set[str] = set()
+    for v in (
+        s.strip(),
+        _repair_json_array_text(s),
+        _escape_raw_controls_in_json_strings(s.strip()),
+        _escape_raw_controls_in_json_strings(_repair_json_array_text(s)),
+        _escape_invalid_json_backslashes_in_strings(s.strip()),
+        _escape_invalid_json_backslashes_in_strings(_repair_json_array_text(s)),
+        _escape_invalid_json_backslashes_in_strings(
+            _escape_raw_controls_in_json_strings(s.strip())
+        ),
+        _escape_raw_controls_in_json_strings(
+            _escape_invalid_json_backslashes_in_strings(s.strip())
+        ),
+    ):
+        if v and v not in seen:
+            seen.add(v)
+            variants.append(v)
+    last_err: str | None = None
+    for v in variants:
+        try:
+            return json.loads(v), None
+        except json.JSONDecodeError as e:
+            last_err = f"{e.msg} (pos {e.pos})"
+    try:
+        from json_repair import repair_json  # type: ignore[import-not-found]
+    except ImportError:
+        repair_json = None
+    if repair_json is not None:
+        for base in variants:
+            try:
+                fixed = repair_json(base)
+                if isinstance(fixed, str) and fixed.strip():
+                    return json.loads(fixed), None
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+    return None, last_err
+
+
+def _balanced_top_level_array_end(s: str, start: int) -> int | None:
+    """从 start（必须为 '['）扫描，返回与之匹配的 ']' 下标；截断或失衡则 None。"""
+    if start >= len(s) or s[start] != "[":
+        return None
+    depth = 0
+    i = start
+    n = len(s)
+    in_string = False
+    escape = False
+    while i < n:
+        c = s[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _balanced_json_object_end(s: str, start: int) -> int | None:
+    """从 start（必须为 '{'）扫描，返回与之匹配的 '}' 下标。"""
+    if start >= len(s) or s[start] != "{":
+        return None
+    depth = 0
+    i = start
+    n = len(s)
+    in_string = False
+    escape = False
+    while i < n:
+        c = s[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _balanced_array_candidates(s: str) -> list[str]:
+    """枚举文本中每个 '[' 开始的平衡数组片段，去重后按长度降序（优先更长、更可能是主输出）。"""
+    spans: list[str] = []
+    n = len(s)
+    for start in range(n):
+        if s[start] != "[":
+            continue
+        end = _balanced_top_level_array_end(s, start)
+        if end is not None:
+            spans.append(s[start : end + 1])
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for sp in spans:
+        if sp not in seen:
+            seen.add(sp)
+            uniq.append(sp)
+    uniq.sort(key=len, reverse=True)
+    return uniq
+
+
+def _is_nonempty_block_list(data: Any) -> bool:
+    """模型输出须为非空、元素均为对象的 JSON 数组（排除 []、[1,2] 等误解析）。"""
+    return (
+        isinstance(data, list)
+        and len(data) > 0
+        and all(isinstance(x, dict) for x in data)
+    )
+
+
+def _coerce_wrapped_object_to_block_list(data: Any) -> list[dict] | None:
+    """顶层为数组，或 JSON 模式常见的 {\"blocks\":[...]} 等包装。"""
+    if _is_nonempty_block_list(data):
+        return data
+    if isinstance(data, dict):
+        for key in (
+            "blocks",
+            "data",
+            "items",
+            "annotations",
+            "result",
+            "content",
+            "output",
+            "sections",
+        ):
+            v = data.get(key)
+            if _is_nonempty_block_list(v):
+                return v
+    return None
+
+
+def _try_parse_dict_object_list(s: str) -> list[dict] | None:
+    """解析 JSON（数组或包装对象），得到非空 dict 元素列表。"""
+    data, _ = _json_loads_variants(s)
+    if data is None:
+        return None
+    return _coerce_wrapped_object_to_block_list(data)
+
+
+def _salvage_type_dicts_from_text(text: str) -> list[dict] | None:
+    """数组整体损坏时，扫描平衡 {...} 片段，解析含 type 字段的对象（支持截断数组或 NDJSON）。"""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"\{", text):
+        k = m.start()
+        end = _balanced_json_object_end(text, k)
+        if end is None:
+            continue
+        sl = text[k : end + 1]
+        if sl in seen or '"type"' not in sl:
+            continue
+        data, _ = _json_loads_variants(sl)
+        if isinstance(data, dict) and "type" in data:
+            seen.add(sl)
+            out.append(data)
+    return out if out else None
+
+
+def _extract_json_array(text: str, section_heading: str = "") -> list[dict] | None:
     """从 DeepSeek 响应文本中提取 JSON 数组。
 
-    依次尝试：直接解析 → 提取 ```json 代码块 → 正则匹配 [...] 片段。
+    依次尝试：直接解析 → 轻量修复后再解析 → 代码块 → 平衡括号候选（避免贪婪正则吃到文内 [12] 等）
+    → 最后保留贪婪正则兜底。
     """
+    text = _strip_common_llm_wrappers(text)
     stripped = text.strip()
+    decode_errors: list[dict] = []
+
+    if (
+        stripped.startswith("{")
+        and stripped.endswith("}")
+        and not stripped.startswith("[")
+    ):
+        top_raw, _ = _json_loads_variants(stripped)
+        if top_raw is not None:
+            coerced_top = _coerce_wrapped_object_to_block_list(top_raw)
+            if coerced_top is not None:
+                return coerced_top
+        wrapped = _try_parse_dict_object_list("[" + stripped + "]")
+        if wrapped is not None:
+            return wrapped
+
     if stripped.startswith("["):
         try:
-            return json.loads(stripped)
-        except json.JSONDecodeError:
-            pass
+            direct_data = json.loads(stripped)
+        except json.JSONDecodeError as e:
+            decode_errors.append({
+                "path": "direct",
+                "msg": e.msg,
+                "pos": e.pos,
+                "lineno": e.lineno,
+                "colno": e.colno,
+            })
+        else:
+            coerced = _coerce_wrapped_object_to_block_list(direct_data)
+            if coerced is not None:
+                return coerced
+        repaired_list = _try_parse_dict_object_list(stripped)
+        if repaired_list is not None:
+            return repaired_list
 
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
     if m:
+        fenced = m.group(1).strip()
         try:
-            return json.loads(m.group(1).strip())
-        except json.JSONDecodeError:
-            pass
+            fenced_data = json.loads(fenced)
+        except json.JSONDecodeError as e:
+            decode_errors.append({
+                "path": "fence",
+                "msg": e.msg,
+                "pos": e.pos,
+                "lineno": e.lineno,
+                "colno": e.colno,
+                "fenced_len": len(fenced),
+            })
+        else:
+            coerced_f = _coerce_wrapped_object_to_block_list(fenced_data)
+            if coerced_f is not None:
+                return coerced_f
+        fenced_list = _try_parse_dict_object_list(fenced)
+        if fenced_list is not None:
+            return fenced_list
+
+    balanced_spans = _balanced_array_candidates(text)
+    last_variant_err: str | None = None
+    for span in balanced_spans:
+        strict_list = _try_parse_dict_object_list(span)
+        if strict_list is not None:
+            return strict_list
+        data, verr = _json_loads_variants(span)
+        if verr:
+            last_variant_err = verr
+        if data is not None:
+            coerced_b = _coerce_wrapped_object_to_block_list(data)
+            if coerced_b is not None:
+                return coerced_b
 
     m = re.search(r"\[.*\]", text, re.DOTALL)
     if m:
+        bracket_slice = m.group(0)
         try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
+            greedy_data = json.loads(bracket_slice)
+        except json.JSONDecodeError as e:
+            decode_errors.append({
+                "path": "bracket_regex",
+                "msg": e.msg,
+                "pos": e.pos,
+                "lineno": e.lineno,
+                "colno": e.colno,
+                "slice_len": len(bracket_slice),
+            })
+        else:
+            coerced_g = _coerce_wrapped_object_to_block_list(greedy_data)
+            if coerced_g is not None:
+                return coerced_g
+        greedy_list = _try_parse_dict_object_list(bracket_slice)
+        if greedy_list is not None:
+            return greedy_list
+
+    salvaged = _salvage_type_dicts_from_text(text)
+    if salvaged is not None:
+        return salvaged
+
+    preview = 240
+    pos_hint = decode_errors[0]["pos"] if decode_errors else None
+    snip = ""
+    if pos_hint is not None and isinstance(pos_hint, int) and 0 <= pos_hint < len(stripped):
+        lo = max(0, pos_hint - 60)
+        hi = min(len(stripped), pos_hint + 60)
+        snip = stripped[lo:hi]
+    _agent_debug_ndjson(
+        "H1-H5",
+        "deepseek_client.py:_extract_json_array",
+        "all_json_paths_failed",
+        {
+            "section_heading": section_heading[:80],
+            "raw_len": len(text),
+            "stripped_len": len(stripped),
+            "starts_with_bracket": stripped.startswith("["),
+            "ends_with_bracket": stripped.rstrip().endswith("]"),
+            "first_bracket_idx": text.find("["),
+            "last_bracket_idx": text.rfind("]"),
+            "decode_errors": decode_errors,
+            "stripped_head": stripped[:preview],
+            "stripped_tail": stripped[-preview:] if len(stripped) > preview else "",
+            "error_pos_snippet": snip,
+            "fence_block_found": bool(
+                re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+            ),
+            "balanced_span_count": len(balanced_spans),
+            "balanced_longest_len": len(balanced_spans[0]) if balanced_spans else 0,
+            "last_variant_json_error": last_variant_err,
+            "type_marker_count": text.count('"type"'),
+        },
+        run_id="post-fix",
+    )
+
+    logger.warning(
+        "JSON 提取失败（诊断）章节=%r balanced=%d type_markers=%d last_err=%s head=%.120s",
+        section_heading[:60],
+        len(balanced_spans),
+        text.count('"type"'),
+        last_variant_err,
+        stripped[:120],
+    )
+
+    _append_parse_failure_human(
+        section_heading, text, len(balanced_spans), last_variant_err
+    )
 
     return None
 
@@ -236,6 +726,52 @@ async def _stream_collect(response) -> tuple[str, dict]:
     return "".join(collected), stats
 
 
+_REPAIR_JSON_SYSTEM = """你是一个 JSON 修复器。用户会给出一段本应合法但可能有语法错误的文本（多为 JSON 数组或对象）。
+请只输出修复后的完整 JSON：要么是 [...] 数组（元素为带 type、level 等字段的对象），要么是 {"blocks":[...]} 对象。
+不要 markdown 代码块，不要推理标签，不要解释。"""
+
+
+async def _async_repair_json_via_model(
+    client: AsyncOpenAI,
+    broken_raw: str,
+) -> str | None:
+    """本地解析失败时，再请求模型只做 JSON 语法纠错（额外消耗 1 次调用）。"""
+    cap = 28000
+    user = (
+        "请修复为合法 JSON（保留所有字段与字符串内容，仅修正引号、逗号、转义、缺失括号等问题）：\n\n"
+        f"{broken_raw[:cap]}"
+    )
+    try:
+        if config.DEEPSEEK_STREAM_ENABLED:
+            response = await client.chat.completions.create(
+                model=config.DEEPSEEK_MODEL,
+                messages=[
+                    {"role": "system", "content": _REPAIR_JSON_SYSTEM},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.0,
+                stream=True,
+                **_max_tokens_kw(),
+            )
+            text, _ = await _stream_collect(response)
+        else:
+            response = await client.chat.completions.create(
+                model=config.DEEPSEEK_MODEL,
+                messages=[
+                    {"role": "system", "content": _REPAIR_JSON_SYSTEM},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.0,
+                **_max_tokens_kw(),
+            )
+            text = (response.choices[0].message.content or "").strip()
+        out = _strip_common_llm_wrappers(text)
+        return out if out else None
+    except (APIError, APITimeoutError, RateLimitError, TypeError, ValueError) as exc:
+        logger.warning("JSON 纠错 API 失败: %s", exc)
+        return None
+
+
 # ── 核心异步 API 调用 ────────────────────────────────────
 
 async def process_chunk_json_async(
@@ -290,8 +826,10 @@ async def process_chunk_json_async(
                     ],
                     temperature=0.2,
                     stream=True,
+                    **_max_tokens_kw(),
                 )
                 raw, stats = await _stream_collect(response)
+                raw = _strip_common_llm_wrappers(raw)
                 last_stats = stats
                 logger.info(
                     "DeepSeek 返回 %d 字符 (流式 %d chunks, %.1fs, keep-alive %d)",
@@ -307,17 +845,75 @@ async def process_chunk_json_async(
                         {"role": "user", "content": user_msg},
                     ],
                     temperature=0.2,
+                    **_max_tokens_kw(),
                 )
                 elapsed = time.monotonic() - t0
-                raw = response.choices[0].message.content.strip()
+                raw = _strip_common_llm_wrappers(
+                    (response.choices[0].message.content or "").strip()
+                )
                 last_stats = {"elapsed": elapsed, "keepalive_count": 0}
                 logger.info("DeepSeek 返回 %d 字符 (%.1fs)", len(raw), elapsed)
 
-            blocks = _extract_json_array(raw)
-            if blocks is not None:
+            blocks = _extract_json_array(raw, section_heading=section_heading)
+            if blocks:
                 validated = _validate_blocks(blocks, profile)
-                logger.info("成功解析 %d 个 JSON blocks", len(validated))
-                return validated, last_stats
+                if validated:
+                    logger.info("成功解析 %d 个 JSON blocks", len(validated))
+                    return validated, last_stats
+
+            if "【" in raw:
+                fb = _fallback_parse_plaintext(raw, heading_level)
+                if fb:
+                    validated = _validate_blocks(fb, profile)
+                    if validated:
+                        logger.info(
+                            "JSON 解析失败，已用【】纯文本回退：%d 个 blocks",
+                            len(validated),
+                        )
+                        return validated, last_stats
+
+            if attempt < config.DEEPSEEK_MAX_RETRIES:
+                logger.warning(
+                    "章节 %r 解析失败，主模型重试 %d/%d（下次为新一次生成）",
+                    section_heading[:50],
+                    attempt,
+                    config.DEEPSEEK_MAX_RETRIES,
+                )
+                continue
+
+            if (
+                config.DEEPSEEK_JSON_REPAIR_ON_FAIL
+                and raw
+                and len(raw.strip()) > 20
+            ):
+                logger.info(
+                    "最后一次尝试：模型 JSON 纠错（额外 1 次请求）… 章节: %s",
+                    section_heading[:40],
+                )
+                fixed = await _async_repair_json_via_model(client, raw)
+                if fixed:
+                    blocks = _extract_json_array(
+                        fixed, section_heading=section_heading
+                    )
+                    if blocks:
+                        validated = _validate_blocks(blocks, profile)
+                        if validated:
+                            logger.info(
+                                "模型纠错后成功解析 %d 个 JSON blocks",
+                                len(validated),
+                            )
+                            return validated, last_stats
+                    logger.warning(
+                        "JSON 纠错后仍无法解析 len=%d 章节=%r head=%.150s",
+                        len(fixed),
+                        section_heading[:50],
+                        fixed[:150],
+                    )
+                else:
+                    logger.warning(
+                        "JSON 纠错无有效返回 章节=%r",
+                        section_heading[:50],
+                    )
 
             logger.warning("JSON 解析失败，插入占位符 block")
             return [_make_placeholder_block(heading_level, section_heading)], last_stats

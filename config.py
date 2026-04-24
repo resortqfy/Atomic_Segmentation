@@ -18,6 +18,8 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_MAX_RETRIES = 3         # API 调用失败最大重试次数
 DEEPSEEK_RETRY_BASE_DELAY = 2    # 指数退避基础延迟（秒）
+# 单次回复最大 token（过小易截断 JSON 尾部）；0 表示不传参，使用接口默认
+DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "8192"))
 
 # ── 并发与流式配置 ────────────────────────────────────────
 DEEPSEEK_STREAM_ENABLED = True
@@ -36,7 +38,18 @@ ADAPTIVE_SLOW_THRESHOLD = 30.0        # 响应 > 30s → 减少并发
 ADAPTIVE_ADJUST_INTERVAL = 3          # 每 N 个请求评估一次
 
 # ── 文本分块配置 ──────────────────────────────────────────
-CHUNK_MAX_CHARS = 2000           # 无标题长段落的最大分块字符数
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "2000"))
+
+# ── JSON 解析纠错（额外一次 API，仅当本地解析失败时）────────────────
+DEEPSEEK_JSON_REPAIR_ON_FAIL = os.getenv(
+    "DEEPSEEK_JSON_REPAIR_ON_FAIL", "1"
+).lower() not in ("0", "false", "no")
+
+# ── 解析失败时的 NDJSON / 文本样本（默认关闭，避免污染仓库）────────────
+ATOMIC_DEBUG_PARSE_LOG = os.getenv(
+    "ATOMIC_DEBUG_PARSE_LOG", ""
+).lower() in ("1", "true", "yes")
+ATOMIC_DEBUG_SESSION_ID = os.getenv("ATOMIC_DEBUG_SESSION_ID", "").strip()
 
 # ── Word 模板配置 ─────────────────────────────────────────
 TEMPLATE_PATH = "合并_正文标注_20251006_第3届.docx"
